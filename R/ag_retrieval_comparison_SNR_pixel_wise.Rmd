@@ -1,0 +1,219 @@
+---
+title: "plot_marker_intensities_per_image"
+author: "LauraK"
+date: "2020-03-18"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+# The analysis is done using the ```EBImage``` package. And adapted from Nils Eling's R code
+
+## This workflow analyses pixel intensities for all of the markers to compare the antigen retrieval procedure in HIER buffer of 80C for 45 minutes vs 95C for 30 minutes.
+
+# There are two samples for the two antigen retrieval procedures. Each sample has 5-7 consecutive slices each 2um-thick 
+
+```{r}
+library(EBImage)
+library(ComplexHeatmap)
+
+# Channel information
+panelOri <- read.csv("~Antigen_retrieval_comparison/3D_AR_80_95_comparison.csv", stringsAsFactors = FALSE)
+```
+
+# Read image stack for one sample (sample 4) for one antigen retrieval condition (80C, stack of 7 slices)
+
+```{r}
+image.list <- list()
+image.list$image.80.4.1 <- readImage("20200112_LK_3D_s4_80_ag_comparison_s0_p3_r1_a1_ac.ome.tiff")
+image.list$image.80.4.2 <- readImage("20200112_LK_3D_s4_80_ag_comparison_s0_p3_r2_a2_ac.ome.tiff")
+image.list$image.80.4.3 <- readImage("20200112_LK_3D_s4_80_ag_comparison_s0_p3_r3_a3_ac.ome.tiff")
+image.list$image.80.4.4 <- readImage("20200112_LK_3D_s4_80_ag_comparison_s0_p3_r4_a4_ac.ome.tiff")
+image.list$image.80.4.5 <- readImage("20200112_LK_3D_s4_80_ag_comparison_s0_p3_r5_a5_ac.ome.tiff")
+image.list$image.80.4.6 <- readImage("20200112_LK_3D_s4_80_ag_comparison_s0_p3_r6_a6_ac.ome.tiff")
+image.list$image.80.4.7 <- readImage("20200112_LK_3D_s4_80_ag_comparison_s0_p3_r7_a7_ac.ome.tiff")
+
+image.list$image.95.4.1 <- readImage("20200112_LK_3D_s4_95_ag_comparison_s0_p7_r1_a1_ac.ome.tiff")
+image.list$image.95.4.2 <- readImage("20200112_LK_3D_s4_95_ag_comparison_s0_p7_r2_a2_ac.ome.tiff")
+image.list$image.95.4.3 <- readImage("20200112_LK_3D_s4_95_ag_comparison_s0_p7_r3_a3_ac.ome.tiff")
+image.list$image.95.4.4 <- readImage("20200112_LK_3D_s4_95_ag_comparison_s0_p7_r4_a4_ac.ome.tiff")
+image.list$image.95.4.5 <- readImage("20200112_LK_3D_s4_95_ag_comparison_s0_p7_r5_a5_ac.ome.tiff")
+```
+
+**Of Note:** In this experiment, the 1st, 15th, 7th-9th, 47th and channel had no antibody included and can be remoeved
+Furthermore, the images are ordered based on isotope mass. 
+It is therefore crucial to correctly link the antibody to the individual channels.
+
+```{r data-cleaning}
+image.list <- lapply(image.list, function(x){x[,,-c(1,3,7,8,9,10,14,15,24,25,26,29,37,40,47)]})
+panel <- panelOri[-c(1,3,7,8,9,10,14,15,24,25,26,29,37,40,47),]
+```
+
+# Displaying function
+
+```{r normalization}
+image.list.norm <- lapply(image.list, function(x){
+  for(i in 1:dim(x)[3]){
+      x[,,i] <- normalize(x[,,i], inputRange = c(min(x[,,i]), quantile(x[,,i], 0.99)))
+  }
+  x
+})
+
+display(image.list.norm$image.80.4.2)
+
+hist(image.list.norm$image.80.4.1[,,15])
+```
+
+# Adaptive thresholding
+
+```{r adaptive-thresholding}
+offset = 0.1
+# Generate binarized images
+image.list.norm.th <- lapply(image.list.norm, function(x){
+  disc <- makeBrush(round(min(c(dim(x[,,1])[1], dim(x[,,1])[2]))/3, digits = -1) + 1, "disc")
+  disc <- disc / sum(disc)
+  cur_bg <- filter2(x, disc)
+  x > cur_bg + offset
+})
+# Smooth to reduce noise
+image.list.norm.th.smooth <- lapply(image.list.norm.th, function(x){
+  medianFilter(x, size = 3)
+})
+
+#display(image.list.norm.th$image.80.4.1)
+
+# Perform segmentation
+# Segment images 
+image.list.norm.segmented <- lapply(image.list.norm.th.smooth, function(x){
+  cur_label <- bwlabel(x)
+  cur_label
+})
+
+#display(colorLabels(image.list.norm.segmented$image.80.4.2))
+
+# Set all objects smaller than the set pixel size to 0 (background)
+# Define minimum size of objects
+pixel_size <- 30
+image.list.norm.segmented.filter <- lapply(image.list.norm.segmented, function(x){
+  x <- combine(lapply(getFrames(x), function(y){
+    y[y %in% names(table(y))[table(y) < pixel_size]] <- 0
+    y
+    }))
+  x
+})
+
+#display(colorLabels(image.list.norm.segmented.filter$image.80.4.1))
+
+# Calculate signal to noise ratio on normalized images
+SNR.adaptive <- mapply(function(image, image.norm.smooth){
+  mapply(function(frame.un, frame.norm.smooth){
+    mean(frame.un[frame.norm.smooth > 0])/mean(frame.un[frame.norm.smooth == 0])
+    },
+              getFrames(image), getFrames(image.norm.smooth))
+}, 
+image.list.norm, image.list.norm.segmented.filter)
+```
+
+# Visualize results
+
+```{r SNR-heatmap, fig.height=10, fig.width=8}
+#Adaptive thresholding
+rownames(SNR.adaptive) <-  panel$channel_target
+Heatmap(SNR.adaptive, cluster_columns  = FALSE, 
+        col =   c('white','#ccebc5','#a8ddb5','#7bccc4','#43a2ca','#0868ac'),
+        cluster_rows = FALSE,
+        column_split = ifelse(grepl("\\.80.", colnames(SNR.adaptive)), "HIER buffer 80C for 50 minutes", 
+                              ifelse(grepl("\\.95.", colnames(SNR.adaptive)), "HIER buffer 95C for 30 minutes", "HIER buffer 95C for 30 minutes")))
+
+```
+
+```{r}
+image.list <- list()
+image.list$image.80.5.1 <- readImage("20200111_LK_3D_s5_80_ag_comparison_s0_p5_r1_a1_ac.ome.tiff")
+image.list$image.80.5.2 <- readImage("20200111_LK_3D_s5_80_ag_comparison_s0_p5_r3_a3_ac.ome.tiff")
+image.list$image.80.5.3 <- readImage("20200111_LK_3D_s5_80_ag_comparison_s0_p5_r4_a4_ac.ome.tiff")
+image.list$image.80.5.4 <- readImage("20200111_LK_3D_s5_80_ag_comparison_s0_p5_r5_a5_ac.ome.tiff")
+image.list$image.80.5.5 <- readImage("20200111_LK_3D_s5_80_ag_comparison_s0_p5_r6_a6_ac.ome.tiff")
+image.list$image.80.5.6 <- readImage("20200111_LK_3D_s5_80_ag_comparison_s0_p5_r7_a7_ac.ome.tiff")
+
+image.list$image.95.5.1 <- readImage("20200110_LK_3D_s5_95_ag_comparison_s0_p4_r1_a1_ac.ome.tiff")
+image.list$image.95.5.2 <- readImage("20200110_LK_3D_s5_95_ag_comparison_s0_p4_r2_a2_ac.ome.tiff")
+image.list$image.95.5.3 <- readImage("20200110_LK_3D_s5_95_ag_comparison_s0_p4_r3_a3_ac.ome.tiff")
+image.list$image.95.5.4 <- readImage("20200110_LK_3D_s5_95_ag_comparison_s0_p4_r4_a4_ac.ome.tiff")
+image.list$image.95.5.5 <- readImage("20200110_LK_3D_s5_95_ag_comparison_s0_p4_r5_a5_ac.ome.tiff")
+image.list$image.95.5.6 <- readImage("20200110_LK_3D_s5_95_ag_comparison_s0_p4_r6_a6_ac.ome.tiff")
+image.list$image.95.5.7 <- readImage("20200110_LK_3D_s5_95_ag_comparison_s0_p4_r7_a7_ac.ome.tiff")
+```
+
+```{r data-cleaning}
+image.list <- lapply(image.list, function(x){x[,,-c(1,3,7,8,9,10,14,15,24,25,26,29,37,40,47)]})
+panel <- panelOri[-c(1,3,7,8,9,10,14,15,24,25,26,29,37,40,47),]
+```
+
+```{r normalization}
+image.list <- lapply(image.list, function(x){
+  for(i in 1:dim(x)[3]){
+      x[,,i] <- normalize(x[,,i], inputRange = c(min(x[,,i]), quantile(x[,,i], 0.99)))
+  }
+  x
+})
+```
+
+# Adaptive thresholding
+
+```{r adaptive-thresholding}
+offset = 0.1
+# Generate binarized images
+image.list.norm.th <- lapply(image.list, function(x){
+  disc <- makeBrush(round(min(c(dim(x[,,1])[1], dim(x[,,1])[2]))/3, digits = -1) + 1, "disc")
+  disc <- disc / sum(disc)
+  cur_bg <- filter2(x, disc)
+  x > cur_bg + offset
+})
+# Smooth to reduce noise
+image.list.norm.th.smooth <- lapply(image.list.norm.th, function(x){
+  medianFilter(x, size = 3)
+})
+
+# Perform segmentation
+# Segment images 
+image.list.norm.segmented <- lapply(image.list.norm.th.smooth, function(x){
+  cur_label <- bwlabel(x)
+  cur_label
+})
+
+# Set all objects smaller than the set pixel size to 0 (background)
+# Define minimum size of objects
+pixel_size <- 30
+image.list.norm.segmented.filter <- lapply(image.list.norm.segmented, function(x){
+  x <- combine(lapply(getFrames(x), function(y){
+    y[y %in% names(table(y))[table(y) < pixel_size]] <- 0
+    y
+    }))
+  x
+})
+
+
+# Calculate signal to noise ratio on normalized images
+SNR.adaptive <- mapply(function(image, image.norm.smooth){
+  mapply(function(frame.un, frame.norm.smooth){
+    mean(frame.un[frame.norm.smooth > 0])/mean(frame.un[frame.norm.smooth == 0])
+    },
+              getFrames(image), getFrames(image.norm.smooth))
+}, 
+image.list, image.list.norm.segmented.filter)
+```
+
+```{r SNR-heatmap, fig.height=10, fig.width=8}
+#Adaptive thresholding
+rownames(SNR.adaptive) <-  panel$clean_target
+Heatmap(SNR.adaptive, cluster_columns  = FALSE, 
+        col =  c('white','#ccebc5','#a8ddb5','#7bccc4','#43a2ca','#0868ac'),
+        cluster_rows = FALSE,
+        column_split = ifelse(grepl("\\.80.", colnames(SNR.adaptive)), "HIER buffer 80C for 50 minutes", 
+                              ifelse(grepl("\\.95.", colnames(SNR.adaptive)), "HIER buffer 95C for 30 minutes", "HIER buffer 95C for 30 minutes")))
+```
+
+
+```{r sessionInfo}
+sessionInfo()
+```
